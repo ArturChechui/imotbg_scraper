@@ -6,7 +6,6 @@ Imot.bg Scraper & Map Exporter CLI
 import argparse
 import json
 import math
-from pdb import pm
 import re
 import sys
 import time
@@ -22,12 +21,12 @@ import xml.etree.ElementTree as ET
 REGION_CONFIGS = {
     "pernik": {
         "slug": "oblast-pernik",
-        "default_region": "област Перник",
+        "osm_region": "Перник",
         "fallback_coords": (42.6036, 23.0365),
     },
     "sofia": {
         "slug": "oblast-sofiya",
-        "default_region": "област София",
+        "osm_region": "Софийска",
         "fallback_coords": (42.6977, 23.3219),
     },
 }
@@ -100,10 +99,7 @@ PROPERTY_PRESETS = {
 
 UI_NOISE_PATTERNS = [
     r'Виж\s+карта.*',
-    r'област\s+София,?',
-    r'област\s+Варна,?',
-    r'област\s+Перник,?',
-    r'област\s+Бургас,?',
+    r'област\s+[А-Яа-яA-Za-z]+,?',
 ]
 
 HEADERS = {
@@ -116,7 +112,6 @@ GEO_HEADERS = {
 }
 
 COORDINATE_CACHE = {}
-
 CACHE_FILE = "geo_cache.json"
 
 # ==============================================================================
@@ -127,10 +122,7 @@ class ImotScraper:
     def __init__(self, base_url, preset_name, region_key, max_workers=6):
         self.base_url = base_url
         self.preset = PROPERTY_PRESETS[preset_name]
-        self.region_info = REGION_CONFIGS.get(region_key, {
-            "default_region": f"област {region_key.capitalize()}",
-            "fallback_coords": (42.6977, 23.3219)
-        })
+        self.region_info = REGION_CONFIGS.get(region_key, REGION_CONFIGS["sofia"])
         self.max_workers = max_workers
 
     def build_page_url(self, page_num):
@@ -172,31 +164,20 @@ class ImotScraper:
 
         return list(valid_links)
 
-    def extract_clean_location(self, soup):
+    def extract_clean_settlement(self, soup):
         loc_node = soup.find('div', class_='location') or soup.find('span', class_='advLocation') or soup.find('span', class_='location')
-        default_reg = self.region_info["default_region"]
+        if not loc_node or not loc_node.contents:
+            return ""
 
-        if not loc_node:
-            return default_reg
-
-        direct_text = str(loc_node.contents[0]).strip()
-        if not direct_text:
-            return default_reg
-
-        # Clean noise patterns
-        clean = direct_text
+        text = str(loc_node.contents[0]).strip()
         for pattern in UI_NOISE_PATTERNS:
-            clean = re.sub(pattern, '', clean, flags=re.IGNORECASE)
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
 
-        clean = re.sub(r'\s+', ' ', clean).strip(' ,')
-
-        if not clean:
-            return default_reg
-
-        clean = re.sub(r'\bс\.\s*', 'v. ', clean, flags=re.IGNORECASE)
-        clean = re.sub(r'\bгр\.\s*', 't. ', clean, flags=re.IGNORECASE)
-
-        return f"{clean}, {default_reg}"
+        # Strip street/micro-district noise
+        text = re.sub(r'\s+(?:ул\.?|кв\.?|квартал|м-т|м\.|местност|пром\.?\s*зона|стопански\s+двор).*$', '', text, flags=re.IGNORECASE)
+        # Extract pure settlement name
+        clean_name = re.sub(r'^(?:v|t|с|гр|гара|село|град)\b\.?\s*', '', text, flags=re.IGNORECASE).strip(' ,.')
+        return clean_name
 
     def parse_listing(self, url):
         html = self.fetch_html(url)
@@ -204,9 +185,9 @@ class ImotScraper:
             return None
 
         soup = BeautifulSoup(html, 'html.parser')
-        clean_loc = self.extract_clean_location(soup)
+        clean_settlement = self.extract_clean_settlement(soup)
         loc_node = soup.find('div', class_='location') or soup.find('span', class_='advLocation') or soup.find('span', class_='location')
-        raw_loc = loc_node.get_text(separator=' ', strip=True) if loc_node else clean_loc
+        raw_loc = loc_node.get_text(separator=' ', strip=True) if loc_node else clean_settlement
 
         title = "N/A"
         title_node = soup.find('div', class_='adTitle') or soup.find('h1') or soup.find('span', class_='advTitle')
@@ -218,7 +199,6 @@ class ImotScraper:
         if cena_node:
             price = cena_node.get_text(strip=True)
         else:
-            # Fallback: search raw HTML or parent price container for the number + currency
             m = re.search(r'(\d[\d\s\.]*\d\s*(?:EUR|BGN|лв\.|евро|€))', html, re.IGNORECASE)
             if m:
                 price = m.group(1).strip()
@@ -245,7 +225,7 @@ class ImotScraper:
         item = {
             "url": url,
             "title": title,
-            "location": clean_loc,
+            "settlement": clean_settlement,
             "raw_location": raw_loc,
             "price": price,
             "size": size,
@@ -361,66 +341,83 @@ def save_coordinate_cache():
     except Exception as e:
         print(f"[!] Failed to save coordinate cache: {e}")
 
-def clean_imot_location_string(raw_location_str, default_region):
-    text = raw_location_str.replace(f", {default_region}", "").strip()
-    text = re.sub(r'\s+(?:ул\.?|кв\.?|квартал|м-т|м\.|местност|пром\.?\s*зона|стопански\s+двор).*$', '', text, flags=re.IGNORECASE)
+def get_village_coordinates(settlement_name, osm_region):
+    if not settlement_name:
+        return None
 
-    village_match = re.search(r'\b(?:с\.|v\.)\s*([А-Яа-яA-Za-z\s-]+)$', text, re.IGNORECASE)
-    if village_match:
-        clean_v = village_match.group(1).strip()
-        return f"v. {clean_v}, {default_region}"
+    settlement_name = re.sub(r'^(?:v|t|с|гр|гара|село|град)\b\.?\s*', '', settlement_name, flags=re.IGNORECASE)
 
-    return f"{text}, {default_region}"
-
-def get_village_coordinates(clean_location_str, default_region):
-    # Standardize cache key
-    clean_name = re.sub(r'^(?:v|t|с|гр|гара)\b\.?\s*', '', clean_location_str, flags=re.IGNORECASE)
-    clean_name = clean_name.replace(f", {default_region}", "").strip(' ,')
-    cache_key = f"{clean_name}, {default_region}"
-
-    # 1. Check in-memory/file cache
+    cache_key = f"{settlement_name}, {osm_region}"
     if cache_key in COORDINATE_CACHE and COORDINATE_CACHE[cache_key] is not None:
-        coords = COORDINATE_CACHE[cache_key]
-        return tuple(coords)  # Return as (lat, lon) tuple
+        return tuple(COORDINATE_CACHE[cache_key])
 
-    # 2. Query Nominatim API if not cached
     url = "https://nominatim.openstreetmap.org/search"
+    query_str = f"{settlement_name}, {osm_region}, България"
+    
     params = {
-        'q': f"{clean_name}, {default_region}, Bulgaria",
-        'layer': 'address',
-        'featureType': 'settlement',
+        'q': query_str,
         'format': 'json',
         'addressdetails': 1,
-        'limit': 5
+        'limit': 10
     }
 
     try:
-        print(f" [API Request] Geocoding: '{clean_name}, {default_region}'...")
+        print(f" [API Request] Geocoding: '{query_str}'...")
         time.sleep(1.1)
 
         res = requests.get(url, params=params, headers=GEO_HEADERS, timeout=5)
         if res.status_code == 200:
             results = res.json()
-            if results:
-                coords = None
-                for item in results:
-                    i_type = item.get('type', '').lower()
-                    i_class = item.get('class', '').lower()
-                    if i_class == 'place' or i_type in ['village', 'town', 'city', 'hamlet', 'locality']:
-                        coords = [float(item['lat']), float(item['lon'])]
-                        break
-                
-                if not coords:
-                    coords = [float(results[0]['lat']), float(results[0]['lon'])]
+            coords = None
 
-                # Cache result and save to disk
+            EXCLUDED_CLASSES = {'railway', 'highway', 'building', 'amenity', 'shop', 'landuse'}
+            EXCLUDED_TYPES = {'railway', 'road', 'street', 'bus_stop', 'station', 'stop', 'house', 'residential', 'commercial'}
+
+            # --- PASS 1: Settlement Node / Place Matching ---
+            for item in results:
+                addr = item.get('address', {})
+                addresstype = item.get('addresstype', '')
+                i_class = item.get('class', '').lower()
+                i_type = item.get('type', '').lower()
+                display_name = item.get('display_name', '')
+
+                if i_class in EXCLUDED_CLASSES or addresstype in EXCLUDED_TYPES or 'ж.к.' in display_name:
+                    continue
+
+                if addresstype in ['village', 'town', 'city', 'hamlet', 'municipality'] or \
+                   (i_class == 'place' and i_type in ['village', 'town', 'city', 'hamlet']):
+                    coords = [float(item['lat']), float(item['lon'])]
+                    print(f" [✓] Matched Settlement: {display_name}")
+                    break
+
+            # --- PASS 2: Settlement Boundary Relation (admin_level 8 / землище) ---
+            if not coords:
+                for item in results:
+                    addr = item.get('address', {})
+                    i_class = item.get('class', '')
+                    i_type = item.get('type', '')
+                    display_name = item.get('display_name', '')
+
+                    if i_class in EXCLUDED_CLASSES or 'ж.к.' in display_name:
+                        continue
+
+                    addr_str = " ".join(str(v) for v in addr.values())
+
+                    if i_class == 'boundary' and i_type == 'administrative':
+                        if osm_region.lower() in addr_str.lower():
+                            coords = [float(item['lat']), float(item['lon'])]
+                            print(f" [✓] Matched Regional Boundary: {display_name}")
+                            break
+
+            if coords:
                 COORDINATE_CACHE[cache_key] = coords
                 save_coordinate_cache()
                 return tuple(coords)
 
     except Exception as e:
-        print(f"[!] Geocoding error for '{clean_name}': {e}")
+        print(f"[!] Geocoding error for '{settlement_name}': {e}")
 
+    print(f" [!] No valid settlement match for '{query_str}'.")
     COORDINATE_CACHE[cache_key] = None
     save_coordinate_cache()
     return None
@@ -433,61 +430,47 @@ def apply_gps_jitter(lat, lon, index, total_items_in_group, radius=0.00045):
     return round(lat + (radius * math.cos(angle)), 6), round(lon + (radius * math.sin(angle)), 6)
 
 def export_map_kml(valid_results, output_kml, region_key):
-    region_info = REGION_CONFIGS.get(region_key, {
-        "default_region": f"област {region_key.capitalize()}",
-        "fallback_coords": (42.6977, 23.3219)
-    })
-    default_reg = region_info["default_region"]
+    region_info = REGION_CONFIGS.get(region_key, REGION_CONFIGS["sofia"])
+    osm_region = region_info["osm_region"]
     fallback_coords = region_info["fallback_coords"]
 
-    # 1. Prepare items & compute Geocoding + GPS Jitter
     prepared_items, location_counts = [], {}
 
+    print(f"\n[+] Geocoding {len(valid_results)} items for KML export...")
     for item in valid_results:
-        raw_loc = item['location']
-        sanitized_loc = clean_imot_location_string(raw_loc, default_reg)
-        prepared_items.append({"raw_item": item, "raw_loc": raw_loc, "sanitized_loc": sanitized_loc})
-
-    print(f"\n[+] Geocoding {len(prepared_items)} items for KML export...")
-    for entry in prepared_items:
-        coords = get_village_coordinates(entry["sanitized_loc"], default_reg)
-        group_key = entry["sanitized_loc"] if coords is not None else "FALLBACK"
-        entry["coords"] = coords
-        entry["group_key"] = group_key
+        settlement = item.get('settlement', '')
+        coords = get_village_coordinates(settlement, osm_region)
+        group_key = settlement if coords is not None else "FALLBACK"
+        
+        prepared_items.append({
+            "raw_item": item,
+            "settlement": settlement,
+            "coords": coords,
+            "group_key": group_key
+        })
         location_counts[group_key] = location_counts.get(group_key, 0) + 1
 
-    # 2. Build KML Tree Structure
+    # Build KML
     kml = ET.Element('kml', xmlns="http://www.opengis.net/kml/2.2")
     document = ET.SubElement(kml, 'Document')
-    # Define Schema ONCE before entering the item loop
+
     schema = ET.SubElement(document, 'Schema', id="PropertySchema", name="PropertySchema")
     ET.SubElement(schema, 'SimpleField', name="Score", type="int")
     ET.SubElement(schema, 'SimpleField', name="Price", type="string")
     ET.SubElement(schema, 'SimpleField', name="Size", type="string")
     ET.SubElement(schema, 'SimpleField', name="URL", type="string")
-    # Red: Score <= 10 (AABBGGRR format: ff0000ff)
-    style_red = ET.SubElement(document, 'Style', id="style_red")
-    icon_red = ET.SubElement(ET.SubElement(style_red, 'IconStyle'), 'Icon')
-    ET.SubElement(icon_red, 'href').text = "http://maps.google.com/mapfiles/ms/icons/red-dot.png"
 
-    # Yellow: Score 11-30 (AABBGGRR format: ff00ffff)
-    style_yellow = ET.SubElement(document, 'Style', id="style_yellow")
-    icon_yellow = ET.SubElement(ET.SubElement(style_yellow, 'IconStyle'), 'Icon')
-    ET.SubElement(icon_yellow, 'href').text = "http://maps.google.com/mapfiles/ms/icons/yellow-dot.png"
-
-    # Green: Score >= 31 (AABBGGRR format: ff0000ff)
-    style_green = ET.SubElement(document, 'Style', id="style_green")
-    icon_green = ET.SubElement(ET.SubElement(style_green, 'IconStyle'), 'Icon')
-    ET.SubElement(icon_green, 'href').text = "http://maps.google.com/mapfiles/ms/icons/green-dot.png"
+    for style_id, color in [("style_red", "red"), ("style_yellow", "yellow"), ("style_green", "green")]:
+        style = ET.SubElement(document, 'Style', id=style_id)
+        icon = ET.SubElement(ET.SubElement(style, 'IconStyle'), 'Icon')
+        ET.SubElement(icon, 'href').text = f"http://maps.google.com/mapfiles/ms/icons/{color}-dot.png"
 
     group_indices = {}
 
-    # 2. Process Placemarks
-    for idx, entry in enumerate(prepared_items, 1):
+    for entry in prepared_items:
         item = entry["raw_item"]
         g_key = entry["group_key"]
 
-        # Calculate Jittered Coordinates
         if entry["coords"] is not None:
             b_lat, b_lon = entry["coords"]
             r = 0.00045
@@ -500,57 +483,36 @@ def export_map_kml(valid_results, output_kml, region_key):
         group_indices[g_key] = c_idx + 1
 
         pm = ET.SubElement(document, 'Placemark')
-
-        # Name / Title
         ET.SubElement(pm, 'name').text = f"{item.get('title', 'N/A')} ({item.get('price', 'N/A')})"
 
-        # ExtendedData (References #PropertySchema created above)
         ext_data = ET.SubElement(pm, 'ExtendedData')
         schema_data = ET.SubElement(ext_data, 'SchemaData', schemaUrl="#PropertySchema")
 
         score = int(item.get('score', 0))
-        if score <= 10:
-            ET.SubElement(pm, 'styleUrl').text = "#style_red"
-        elif 11 <= score <= 30:
-            ET.SubElement(pm, 'styleUrl').text = "#style_yellow"
-        else:
-            ET.SubElement(pm, 'styleUrl').text = "#style_green"
+        style_ref = "#style_red" if score <= 10 else ("#style_yellow" if score <= 30 else "#style_green")
+        ET.SubElement(pm, 'styleUrl').text = style_ref
 
-        p_val = ET.SubElement(schema_data, 'SimpleData', name="Price")
-        p_val.text = str(item.get('price', 'N/A'))
+        ET.SubElement(schema_data, 'SimpleData', name="Price").text = str(item.get('price', 'N/A'))
+        ET.SubElement(schema_data, 'SimpleData', name="Size").text = str(item.get('size', 'N/A'))
+        ET.SubElement(schema_data, 'SimpleData', name="URL").text = item.get('url', '')
 
-        z_val = ET.SubElement(schema_data, 'SimpleData', name="Size")
-        z_val.text = str(item.get('size', 'N/A'))
-
-        u_val = ET.SubElement(schema_data, 'SimpleData', name="URL")
-        u_val.text = item.get('url', '')
-
-        # HTML Popup Description
         img_url = item.get('image_url', '')
         html_desc = f"""<![CDATA[
             <div style="font-family: sans-serif; max-width: 320px;">
                 {'<img src="' + img_url + '" style="width:100%; height:auto; max-height:220px; object-fit:cover; border-radius:6px; margin-bottom:12px;"/>' if img_url else ''}
-
                 <hr style="border:0; border-top:1px solid #ccc; margin:10px 0;"/>
-
                 <p style="margin:4px 0;"><b>Matched:</b> {', '.join(item.get('pos_matches', [])) or 'None'}</p>
                 <p style="margin:4px 0;"><b>Penalties:</b> {', '.join(item.get('neg_matches', [])) or 'None'}</p>
-
                 <hr style="border:0; border-top:1px solid #ccc; margin:10px 0;"/>
-
                 <p style="margin-top:6px; color:#444;"><b>Description:</b></p>
                 <p style="color:#555; font-size:13px; line-height:1.4;">{item.get('description', '')[:250]}...</p>
             </div>
         ]]>"""
         
-        desc_elem = ET.SubElement(pm, 'description')
-        desc_elem.text = html_desc
-
-        # Coordinates
+        ET.SubElement(pm, 'description').text = html_desc
         point = ET.SubElement(pm, 'Point')
         ET.SubElement(point, 'coordinates').text = f"{jit_lon},{jit_lat},0"
 
-    # Write file
     tree = ET.ElementTree(kml)
     ET.indent(tree, space="  ")
     tree.write(output_kml, encoding='utf-8', xml_declaration=True)
@@ -570,18 +532,18 @@ def main():
     scrape_parser.add_argument("--type", choices=["land", "houses"], default="houses", help="Property type preset (default: houses)")
     scrape_parser.add_argument("--region", choices=["sofia", "pernik"], default="sofia", help="Region key (default: sofia)")
     scrape_parser.add_argument("--price-max", type=int, default=50000, help="Max price cap (default: 50000)")
-    scrape_parser.add_argument("--out-json", default="imot.json", help="Output JSON filename (default: imot.json)")
     scrape_parser.add_argument("--export-map", action="store_true", help="Automatically generate map after scraping")
-    scrape_parser.add_argument("--out-kml",  default="map.kml", help="Output KML map file (default: map.kml)")
     scrape_parser.add_argument("--workers", type=int, default=6, help="Concurrent threads (default: 6)")
 
     # Export Subcommand
     export_parser = subparsers.add_parser("export", help="Export existing JSON to Map KML")
-    export_parser.add_argument("--in-json", default="imot.json", help="Input JSON report file (default: imot.json)")
-    export_parser.add_argument("--out-kml",  default="map.kml", help="Output KML map file (default: map.kml)")
     export_parser.add_argument("--region", choices=["sofia", "pernik"], default="sofia", help="Region key (default: sofia)")
+    export_parser.add_argument("--in-json", default=None, help="Input JSON report file (default: imot_{region}.json)")
 
     args = parser.parse_args()
+
+    out_json = f"imot_{args.region}.json"
+    out_kml = f"map_{args.region}.kml"
 
     if args.command == "scrape":
         target_url = args.url if args.url else build_search_url(args.region, args.type, args.price_max)
@@ -590,23 +552,21 @@ def main():
         scraper = ImotScraper(base_url=target_url, preset_name=args.type, region_key=args.region, max_workers=args.workers)
         results = scraper.run()
 
-        with open(args.out_json, "w", encoding="utf-8") as f:
+        with open(out_json, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f" 📁 Saved Full JSON Data: {args.out_json}")
+        print(f"Saved Full JSON Data: {out_json}")
 
         if args.export_map:
-            if not args.out_kml:
-                print("[!] Error: --out-kml is required when using --export-map.")
-                sys.exit(1)
-            export_map_kml(results, args.out_kml, args.region)
+            export_map_kml(results, out_kml, args.region)
 
     elif args.command == "export":
+        in_json = args.in_json or f"imot_{args.region}.json"
         try:
-            with open(args.in_json, "r", encoding="utf-8") as f:
+            with open(in_json, "r", encoding="utf-8") as f:
                 results = json.load(f)
-            export_map_kml(results, args.out_kml, args.region)
+            export_map_kml(results, out_kml, args.region)
         except FileNotFoundError:
-            print(f"[!] Error: File '{args.in_json}' not found.")
+            print(f"[!] Error: File '{in_json}' not found.")
             sys.exit(1)
 
 if __name__ == "__main__":
